@@ -6,6 +6,11 @@ import os  # noqa
 import signal  # noqa
 import sys  # noqa
 from distutils import util
+import subprocess
+import atexit
+from threading import Thread
+from multiprocessing import Process
+
 
 # Do this before importing anything else, we need to add bundled requirements
 # from the distributed version in case it exists before importing anything
@@ -432,6 +437,86 @@ def setup_logging(debug=False):
     logger.debug("Debug mode is on!")
 
 
+webpack_cleanup_closing = False
+webpack_process = None
+devserver_process = None
+
+def kill_webpack_process():
+
+    if webpack_process and webpack_process.returncode is not None:
+        return
+
+    logger.info('Closing webpack process')
+
+    global webpack_cleanup_closing
+    webpack_cleanup_closing = True
+
+    if webpack_process is not None:
+        webpack_process.terminate()
+
+
+def start_webpack(lint=False):
+
+    if lint:
+        cli_command = 'yarn run watch -- --lint'
+        logger.info(
+            'Starting webpack process with linting from Django runserver command'
+        )
+    else:
+        cli_command = 'yarn run watch'
+        logger.info(
+            'Starting webpack process from Django runserver command')
+
+    global webpack_process
+    webpack_process = subprocess.Popen(
+        cli_command,
+        shell=True,
+        stdin=subprocess.PIPE,
+        stdout=sys.stdout,
+        stderr=sys.stderr)
+
+    if webpack_process.poll() is not None:
+        raise SystemError(
+            'Webpack process failed to start from Django runserver command'
+        )
+
+    logger.info(
+        'Django Runserver command has spawned a Webpack watcher process on pid {0}'.
+        format(webpack_process.pid))
+
+    webpack_process.wait()
+
+    if webpack_process.returncode != 0 and not webpack_cleanup_closing:
+        logger.error("Webpack process exited unexpectedly.")
+        devserver_process.terminate()
+        sys.exit(0)
+
+
+def spawn_subprocess(process_start, process_kill, **kwargs):
+    # We're subclassing runserver, which spawns threads for its
+    # autoreloader with RUN_MAIN set to true, we have to check for
+    # this to avoid running browserify twice.
+    if not os.getenv('RUN_MAIN', False) and not webpack_process:
+        subprocess_thread = Thread(target=process_start, kwargs=kwargs)
+        subprocess_thread.daemon = True
+        subprocess_thread.start()
+        atexit.register(process_kill)
+
+
+def spawn_devserver(**kwargs):
+    global devserver_process
+    if not os.getenv('RUN_MAIN', False) and not devserver_process:
+        from django.core.management import execute_from_command_line
+        devserver_process = Process(target=execute_from_command_line, args=(kwargs['argv'],))
+        devserver_process.start()
+
+def kill_devserver_process():
+    if devserver_process is None:
+        return
+    logger.info('Closing devserver process')
+    devserver_process.terminate()
+
+
 def manage(cmd, args=[]):
     """
     Invokes a django command
@@ -442,9 +527,21 @@ def manage(cmd, args=[]):
     # Set sys.argv to correctly reflect the way we invoke kolibri as a Python
     # module
     sys.argv = ["-m", "kolibri"] + sys.argv[1:]
-    from django.core.management import execute_from_command_line
     argv = ['kolibri manage', cmd] + args
-    execute_from_command_line(argv=argv)
+
+    if '--webpack' in argv:
+        lint = False
+        if '--lint' in argv:
+            lint = True
+            argv.remove('--lint')
+        spawn_subprocess(
+            start_webpack,
+            kill_webpack_process,
+            lint=lint)
+        argv.remove('--webpack')
+
+    devserver = Thread(target=spawn_devserver, kwargs={'argv': argv})
+    devserver.start()
 
 
 def _is_plugin(obj):
